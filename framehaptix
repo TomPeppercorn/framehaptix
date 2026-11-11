@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# framehaptix - adjust the Framework Laptop 13 (Pro) haptic touchpad (PIXA3854)
+#
+# Sets click sensitivity (HID feature 80000 -> report 0x08, values 1/2/3) and
+# haptic intensity (HID feature 90000 -> report 0x09, values 0-100) through
+# `hid-feature` from hid-tools, persists them, and re-applies them on demand.
+#
+# SPDX-License-Identifier: MIT
+# https://github.com/tompeppercorn/framehaptix
+
+set -u
+
+readonly VERSION=0.1.0
+readonly PROG=framehaptix
+
+# --- tunables (environment overrides exist mainly for testing) ---------------
+DEVICE_MATCH=${FRAMEHAPTIX_DEVICE_MATCH:-PIXA3854}
+SYSFS=${FRAMEHAPTIX_SYSFS:-/sys}
+DEVDIR=${FRAMEHAPTIX_DEVDIR:-/dev}
+HID_FEATURE=${FRAMEHAPTIX_HID_FEATURE:-hid-feature}
+FRAMEWORK_TOOL=${FRAMEHAPTIX_FRAMEWORK_TOOL:-framework_tool}
+CONFIG_DIR=${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/$PROG
+CONFIG=$CONFIG_DIR/config
+
+# pipx/pip --user install hid-feature into ~/.local/bin, which is not on the
+# PATH of systemd user services; look there too (lowest priority).
+[[ -n ${HOME:-} && :$PATH: != *":$HOME/.local/bin:"* ]] && PATH=$PATH:$HOME/.local/bin
+
+readonly SENS_FEATURE=80000   # report 0x08, field 0: button press threshold
+readonly HAPTIC_FEATURE=90000 # report 0x09, field 0: haptic intensity
+
+readonly DEFAULT_SENSITIVITY=medium
+readonly DEFAULT_HAPTIC=50
+readonly DEFAULT_BACKEND=auto
+
+# Return codes used internally by the write path.
+readonly RC_FAIL=1 RC_PERM=2 RC_WRONG_NODE=3 RC_NO_DEVICE=10 RC_NO_TOOL=11
+
+ELEVATE=1
+[[ -n ${FRAMEHAPTIX_NO_ELEVATE:-} ]] && ELEVATE=0
+LAST_ERR=
+APPLIED_NODE=
+
+# --- output helpers -----------------------------------------------------------
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+usage() {
+	cat <<EOF
+$PROG $VERSION - Framework haptic touchpad settings
+
+Usage:
+  $PROG                         interactive menu (launcher or terminal)
+  $PROG menu [--tty]            same; --tty forces the terminal menu
+  $PROG sensitivity low|medium|high
+  $PROG haptic off|low|medium|high|0-100
+  $PROG apply [--wait SECONDS]  re-apply saved preferences (login/resume hook)
+  $PROG watch                   apply now, then again after every resume
+  $PROG status                  show device, access and saved preferences
+  $PROG help | version
+
+Options (any position):
+  --no-elevate                  never fall back to pkexec
+
+haptic presets: off=0 low=25 medium=50 high=100. Numbers are clamped to 0-100.
+Preferences: $CONFIG
+EOF
+}
+
+usage_error() { warn "$*"; usage >&2; exit 2; }
+
+install_hint() {
+	cat >&2 <<'EOF'
+framehaptix: `hid-feature` (from hid-tools) was not found. Install it with one of:
+    Arch Linux:   sudo pacman -S hid-tools
+    Anywhere:     pipx install hid-tools      (or: pip install --user hid-tools)
+  Alternatively install `framework_tool` (FrameworkComputer/framework-system)
+  and set `backend=framework_tool` in the config file.
+EOF
+}
+
+# --- value mapping & validation -------------------------------------------------
+# sensitivity name/number -> 1..3
+sens_value() {
+	case ${1,,} in
+	low | 1) echo 1 ;;
+	medium | med | 2) echo 2 ;;
+	high | 3) echo 3 ;;
+	*) return 1 ;;
+	esac
+}
+sens_name() { case $1 in 1) echo low ;; 2) echo medium ;; 3) echo high ;; esac; }
+
+# haptic name/number -> 0..100 (clamped)
+haptic_value() {
+	local v=${1,,}
+	case $v in
+	off) echo 0 ;;
+	low) echo 25 ;;
+	medium | med) echo 50 ;;
+	high | max) echo 100 ;;
+	*)
+		[[ $v =~ ^[+-]?[0-9]{1,9}$ ]] || return 1
+		local sign=
+		[[ $v == -* ]] && sign=-
+		v=${v#[+-]}
+		v=$((10#$v))
+		[[ -n $sign ]] && v=0
+		((v > 100)) && v=100
+		echo "$v"
+		;;
+	esac
+}
+haptic_label() {
+	case $1 in
+	0) echo "0 (off)" ;; 25) echo "25 (low)" ;; 50) echo "50 (medium)" ;;
+	100) echo "100 (high)" ;; *) echo "$1" ;;
+	esac
+}
+
+# --- config ----------------------------------------------------------------------
+SENSITIVITY=$DEFAULT_SENSITIVITY
+HAPTIC=$DEFAULT_HAPTIC
+BACKEND=$DEFAULT_BACKEND
+
+load_config() {
+	SENSITIVITY=$DEFAULT_SENSITIVITY HAPTIC=$DEFAULT_HAPTIC BACKEND=$DEFAULT_BACKEND
+	[[ -r $CONFIG ]] || return 0
+	local key val n
+	while IFS='=' read -r key val || [[ -n $key ]]; do
+		key=${key//[[:space:]]/}
+		val=${val%%#*}
+		val=${val//[[:space:]\"\']/}
+		[[ -z $key || $key == \#* ]] && continue
+		case $key in
+		sensitivity)
+			if n=$(sens_value "$val"); then SENSITIVITY=$(sens_name "$n")
+			else warn "config: ignoring bad sensitivity '$val'"; fi ;;
+		haptic)
+			if n=$(haptic_value "$val"); then HAPTIC=$n
+			else warn "config: ignoring bad haptic '$val'"; fi ;;
+		backend)
+			case $val in
+			auto | hid-feature | framework_tool) BACKEND=$val ;;
+			*) warn "config: ignoring bad backend '$val'" ;;
+			esac ;;
+		*) warn "config: ignoring unknown key '$key'" ;;
+		esac
+	done <"$CONFIG"
+	[[ -n ${FRAMEHAPTIX_BACKEND:-} ]] && BACKEND=$FRAMEHAPTIX_BACKEND
+	return 0
+}
+
+save_config() {
+	mkdir -p "$CONFIG_DIR" || die "cannot create $CONFIG_DIR"
+	local tmp
+	tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX") || die "cannot write $CONFIG_DIR"
+	cat >"$tmp" <<EOF
+# $PROG preferences (re-applied by '$PROG apply')
+# sensitivity: low|medium|high   haptic: 0-100 (0 = off)
+# backend: auto|hid-feature|framework_tool
+sensitivity=$SENSITIVITY
+haptic=$HAPTIC
+backend=$BACKEND
+EOF
+	mv -f "$tmp" "$CONFIG" || { rm -f "$tmp"; die "cannot write $CONFIG"; }
+}
+
+# --- device discovery -----------------------------------------------------------
+# Prints "NODE<TAB>NAME" for every hidraw node whose HID device name contains
+# $DEVICE_MATCH. Primary source is sysfs (no privileges needed); falls back to
+# parsing `hid-feature list-devices` (which only works if every hidraw node is
+# readable, so it is a last resort).
+find_devices() {
+	local d name found=0
+	for d in "$SYSFS"/class/hidraw/hidraw*; do
+		[[ -e $d/device/uevent ]] || continue
+		name=$(sed -n 's/^HID_NAME=//p' "$d/device/uevent" 2>/dev/null)
+		if [[ $name == *"$DEVICE_MATCH"* ]]; then
+			printf '%s\t%s\n' "$DEVDIR/${d##*/}" "$name"
+			found=1
+		fi
+	done
+	((found)) && return 0
+	[[ -d $SYSFS/class/hidraw ]] && return 0 # sysfs works, device just absent
+	command -v "$HID_FEATURE" >/dev/null 2>&1 || return 0
+	"$HID_FEATURE" list-devices 2>/dev/null |
+		sed -n "s|^\(/dev/hidraw[0-9][0-9]*\): \(.*$DEVICE_MATCH.*\)$|\1\t\2|p"
+}
+
+device_nodes() { find_devices | cut -f1; }
+
+# --- backends --------------------------------------------------------------------
+resolve_backend() { # -> echoes hid-feature|framework_tool, or returns RC_NO_TOOL
+	case $BACKEND in
+	hid-feature | framework_tool) command -v "$(backend_cmd "$BACKEND")" >/dev/null 2>&1 &&
+		{ echo "$BACKEND"; return 0; } ;;
+	*)
+		if command -v "$HID_FEATURE" >/dev/null 2>&1; then echo hid-feature; return 0; fi
+		if command -v "$FRAMEWORK_TOOL" >/dev/null 2>&1; then echo framework_tool; return 0; fi ;;
+	esac
+	return "$RC_NO_TOOL"
+}
+backend_cmd() { [[ $1 == framework_tool ]] && echo "$FRAMEWORK_TOOL" || echo "$HID_FEATURE"; }
+
+classify_failure() { # $1 = tool output -> return code
+	LAST_ERR=$1
+	case $1 in
+	*"Permission denied"* | *"Errno 13"* | *"Operation not permitted"* | *"EACCES"*) return "$RC_PERM" ;;
+	*"Invalid feature index"*) return "$RC_WRONG_NODE" ;;
+	esac
+	return "$RC_FAIL"
+}
+
+hf_set() { # node feature value
+	local out
+	out=$("$HID_FEATURE" set "$1" -f "$2" "$3" 2>&1) && return 0
+	classify_failure "$out"
+}
+
+# Write both settings via hid-feature, trying every matching hidraw node until
+# one accepts the feature reports. Sets APPLIED_NODE on success.
+write_hid_feature() { # sens(1-3) haptic(0-100)
+	local node rc perm=0 any=0
+	for node in $(device_nodes); do
+		any=1
+		hf_set "$node" "$SENS_FEATURE" "$1"; rc=$?
+		if ((rc == 0)); then
+			hf_set "$node" "$HAPTIC_FEATURE" "$2"; rc=$?
+		fi
+		case $rc in
+		0) APPLIED_NODE=$node; return 0 ;;
+		"$RC_PERM") perm=1 ;;
+		"$RC_WRONG_NODE") ;;
+		*) return "$RC_FAIL" ;;
+		esac
+	done
+	((any)) || return "$RC_NO_DEVICE"
+	((perm)) && return "$RC_PERM"
+	LAST_ERR="no $DEVICE_MATCH hidraw node accepted feature reports $SENS_FEATURE/$HAPTIC_FEATURE"
+	return "$RC_FAIL"
+}
+
+# framework_tool locates the touchpad itself and only accepts haptic levels
+# 0/25/50/75/100 (that is all the firmware implements), so round to nearest.
+write_framework_tool() { # sens(1-3) haptic(0-100)
+	local level=$(((($2 + 12) / 25) * 25)) out
+	out=$("$FRAMEWORK_TOOL" --click-force "$(sens_name "$1")" 2>&1) || { classify_failure "$out"; return; }
+	out=$("$FRAMEWORK_TOOL" --haptic-intensity "$level" 2>&1) || { classify_failure "$out"; return; }
+	APPLIED_NODE="(framework_tool)"
+}
+
+write_settings() { # backend sens haptic
+	case $1 in
+	framework_tool) write_framework_tool "$2" "$3" ;;
+	*) write_hid_feature "$2" "$3" ;;
+	esac
+}
+
+# Root-side helper invoked through pkexec. Never trusts the caller's
+# environment: tool path must be absolute, values are re-validated.
+privileged_write() { # backend tool-path sens haptic
+	((EUID == 0)) || die "__write must run as root"
+	[[ $# -eq 4 ]] || die "__write: bad arguments"
+	local backend=$1 tool=$2 sens=$3 hap=$4
+	[[ $backend == hid-feature || $backend == framework_tool ]] || die "__write: bad backend"
+	[[ $tool == /* && -x $tool ]] || die "__write: tool must be an absolute executable path"
+	[[ $sens =~ ^[123]$ ]] || die "__write: bad sensitivity"
+	{ [[ $hap =~ ^[0-9]{1,3}$ ]] && ((10#$hap <= 100)); } || die "__write: bad haptic"
+	hap=$((10#$hap))
+	SYSFS=/sys DEVDIR=/dev DEVICE_MATCH=PIXA3854
+	if [[ $backend == framework_tool ]]; then FRAMEWORK_TOOL=$tool; else HID_FEATURE=$tool; fi
+	write_settings "$backend" "$sens" "$hap"
+	local rc=$?
+	((rc == 0)) || warn "${LAST_ERR:-write failed (code $rc)}"
+	exit "$rc"
+}
+
+# --- apply -----------------------------------------------------------------------
+# Applies the loaded preferences. Exit status: 0 on success or when the
+# touchpad is simply not present; 1 on failure.
+do_apply() { # [wait-seconds]
+	local wait=${1:-0} backend rc sens deadline
+	sens=$(sens_value "$SENSITIVITY")
+	deadline=$((SECONDS + wait))
+	while :; do
+		if [[ -z $(device_nodes) ]]; then
+			if ((SECONDS < deadline)); then sleep 1; continue; fi
+			say "No $DEVICE_MATCH haptic touchpad found; nothing to apply (not this machine's touchpad)."
+			return 0
+		fi
+		backend=$(resolve_backend) || { install_hint; return 1; }
+		LAST_ERR=
+		write_settings "$backend" "$sens" "$HAPTIC"; rc=$?
+		if ((rc == 0)); then
+			say "Applied sensitivity=$SENSITIVITY haptic=$HAPTIC on $APPLIED_NODE."
+			return 0
+		fi
+		# Retry while waiting (e.g. right after resume, before udev has
+		# re-applied the uaccess ACL or the node has settled).
+		((SECONDS < deadline)) || break
+		sleep 1
+	done
+
+	if ((rc == RC_PERM)); then
+		if ((ELEVATE)) && command -v pkexec >/dev/null 2>&1; then
+			warn "no access to the touchpad hidraw node; asking for root via pkexec" \
+				"(install the udev rule to avoid this)"
+			local self tool
+			self=$(readlink -f -- "$0")
+			tool=$(readlink -f -- "$(command -v "$(backend_cmd "$backend")")")
+			if pkexec "$self" __write "$backend" "$tool" "$sens" "$HAPTIC"; then
+				say "Applied sensitivity=$SENSITIVITY haptic=$HAPTIC (via pkexec)."
+				return 0
+			fi
+			warn "privileged write via pkexec failed"
+			return 1
+		fi
+		warn "permission denied writing the touchpad hidraw node."
+		warn "Install the udev rule (see README), or run interactively without --no-elevate."
+		return 1
+	fi
+	warn "failed to apply settings: ${LAST_ERR:-touchpad disappeared while writing}"
+	[[ $backend == hid-feature ]] && warn "if this persists, try backend=framework_tool in $CONFIG"
+	return 1
+}
+
+# --- commands ----------------------------------------------------------------------
+cmd_sensitivity() {
+	[[ $# -eq 1 ]] || usage_error "sensitivity takes exactly one of: low medium high"
+	local n
+	n=$(sens_value "$1") || usage_error "invalid sensitivity '$1' (use low, medium or high)"
+	load_config
+	SENSITIVITY=$(sens_name "$n")
+	save_config
+	do_apply
+}
+
+cmd_haptic() {
+	[[ $# -eq 1 ]] || usage_error "haptic takes exactly one of: off low medium high 0-100"
+	local n
+	n=$(haptic_value "$1") || usage_error "invalid haptic '$1' (use off, low, medium, high or 0-100)"
+	load_config
+	HAPTIC=$n
+	save_config
+	do_apply
+}
+
+cmd_apply() {
+	local wait=0
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--wait) [[ ${2:-} =~ ^[0-9]+$ ]] || usage_error "--wait needs a number of seconds"
+			wait=$2; shift 2 ;;
+		*) usage_error "unknown apply option '$1'" ;;
+		esac
+	done
+	load_config
+	do_apply "$wait"
+}
+
+cmd_status() {
+	[[ $# -eq 0 ]] || usage_error "status takes no arguments"
+	load_config
+	local devs backend tool node name access
+	say "$PROG $VERSION"
+	devs=$(find_devices)
+	if [[ -z $devs ]]; then
+		say "device:      no $DEVICE_MATCH haptic touchpad found"
+	else
+		while IFS=$'\t' read -r node name; do
+			if [[ -r $node && -w $node ]]; then access="accessible"
+			else access="needs root (install the udev rule)"; fi
+			say "device:      $node  $name  [$access]"
+		done <<<"$devs"
+	fi
+	if backend=$(resolve_backend); then
+		tool=$(command -v "$(backend_cmd "$backend")")
+		say "backend:     $backend ($tool)${BACKEND:+, configured: $BACKEND}"
+	else
+		say "backend:     none found (install hid-tools; see '$PROG help')"
+	fi
+	say "config:      $CONFIG$([[ -e $CONFIG ]] || echo ' (not yet created; defaults shown)')"
+	say "sensitivity: $SENSITIVITY ($(sens_value "$SENSITIVITY"))"
+	say "haptic:      $(haptic_label "$HAPTIC")"
+	say "note:        the touchpad does not reliably report these values back, so the"
+	say "             values above are your saved preferences, not a device read-back."
+}
+
+# Launcher detection: $FRAMEHAPTIX_MENU (used verbatim), else the first of the
+# usual dmenu-compatible launchers that exists for the current session.
+LAUNCHER=()
+LAUNCHER_PROMPT=0 # 1 = we know how to pass a prompt to the detected launcher
+find_launcher() {
+	if [[ -n ${FRAMEHAPTIX_MENU:-} ]]; then
+		read -r -a LAUNCHER <<<"$FRAMEHAPTIX_MENU"
+		return 0
+	fi
+	local c
+	if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+		for c in "fuzzel --dmenu" "wofi --dmenu" "tofi" "bemenu" "rofi -dmenu" "wmenu"; do
+			command -v "${c%% *}" >/dev/null 2>&1 && { read -r -a LAUNCHER <<<"$c"; LAUNCHER_PROMPT=1; return 0; }
+		done
+	fi
+	if [[ -n ${DISPLAY:-} ]]; then
+		for c in "rofi -dmenu" "dmenu"; do
+			command -v "${c%% *}" >/dev/null 2>&1 && { read -r -a LAUNCHER <<<"$c"; LAUNCHER_PROMPT=1; return 0; }
+		done
+	fi
+	return 1
+}
+
+# pick PROMPT OPTION... -> echoes the chosen option (empty on cancel)
+pick() {
+	local prompt=$1; shift
+	if ((${#LAUNCHER[@]})); then
+		local args=("${LAUNCHER[@]}")
+		if ((LAUNCHER_PROMPT)); then
+			case ${args[0]} in
+			tofi) args+=("--prompt-text=$prompt: ") ;;
+			*) args+=(-p "$prompt") ;;
+			esac
+		fi
+		printf '%s\n' "$@" | "${args[@]}" 2>/dev/null
+	else
+		local PS3="$prompt> " choice
+		select choice in "$@"; do
+			[[ -n $choice ]] && { echo "$choice" >&3; return; }
+			[[ -z $REPLY ]] || echo "Pick a number from the list."
+		done </dev/tty 3>&1 >&2 # menu on stderr, answer on the original stdout
+	fi
+}
+
+notify() {
+	if ((${#LAUNCHER[@]})) && command -v notify-send >/dev/null 2>&1; then
+		notify-send -a "$PROG" "Touchpad" "$*" 2>/dev/null || say "$*"
+	else
+		say "$*"
+	fi
+}
+
+cmd_menu() {
+	local tty=0
+	[[ ${1:-} == --tty ]] && { tty=1; shift; }
+	[[ $# -eq 0 ]] || usage_error "unknown menu option '$1'"
+	if ((tty)) || ! find_launcher; then
+		LAUNCHER=()
+		[[ -t 0 || -r /dev/tty ]] || die "no menu launcher found and no terminal; set FRAMEHAPTIX_MENU"
+	fi
+	local choice val out
+	while :; do
+		load_config
+		choice=$(pick "touchpad" \
+			"Sensitivity: $SENSITIVITY" \
+			"Haptic intensity: $(haptic_label "$HAPTIC")" \
+			"Re-apply saved settings" \
+			"Status" \
+			"Quit")
+		case $choice in
+		Sensitivity*)
+			val=$(pick "sensitivity" low medium high) || val=
+			[[ -n $val ]] && { out=$(cmd_sensitivity "$val" 2>&1); notify "$out"; } ;;
+		Haptic*)
+			local opts=(off low medium high)
+			((${#LAUNCHER[@]})) || opts+=("custom (0-100)")
+			val=$(pick "haptic" "${opts[@]}") || val=
+			if [[ $val == custom* ]]; then
+				read -r -p "haptic intensity 0-100: " val </dev/tty || val=
+			fi
+			if [[ -n $val ]] && ! haptic_value "$val" >/dev/null; then
+				notify "invalid haptic '$val' (use 0-100)"
+			elif [[ -n $val ]]; then
+				out=$(cmd_haptic "$val" 2>&1); notify "$out"
+			fi ;;
+		Re-apply*) out=$(cmd_apply 2>&1); notify "$out" ;;
+		Status) out=$(cmd_status 2>&1); if ((${#LAUNCHER[@]})); then printf '%s\n' "$out" | pick "status" >/dev/null; else say "$out"; fi ;;
+		*) return 0 ;;
+		esac
+		((${#LAUNCHER[@]})) && return 0 # launcher mode: one action per invocation
+	done
+}
+
+# Apply now, then re-apply whenever systemd-logind reports resume
+# (PrepareForSleep(false)). Desktop-agnostic: only needs gdbus + logind.
+cmd_watch() {
+	[[ $# -eq 0 ]] || usage_error "watch takes no arguments"
+	load_config
+	do_apply 15
+	if ! command -v gdbus >/dev/null 2>&1; then
+		warn "gdbus not found (glib2); cannot watch for resume. Settings applied once."
+		return 0
+	fi
+	local line
+	while IFS= read -r line; do
+		case $line in
+		*PrepareForSleep*false*)
+			sleep 2 # let the I2C touchpad re-enumerate
+			load_config
+			do_apply 15 ;;
+		esac
+	done < <(gdbus monitor --system --dest org.freedesktop.login1 \
+		--object-path /org/freedesktop/login1 2>/dev/null)
+	warn "lost connection to systemd-logind"
+	return 1
+}
+
+# --- main ----------------------------------------------------------------------------
+main() {
+	local args=() a
+	for a in "$@"; do
+		case $a in
+		--no-elevate) ELEVATE=0 ;;
+		*) args+=("$a") ;;
+		esac
+	done
+	set -- "${args[@]+"${args[@]}"}"
+
+	local cmd=${1:-menu}
+	[[ $# -gt 0 ]] && shift
+	case $cmd in
+	menu) cmd_menu "$@" ;;
+	sensitivity | sens) cmd_sensitivity "$@" ;;
+	haptic | haptics | intensity) cmd_haptic "$@" ;;
+	apply) cmd_apply "$@" ;;
+	watch) cmd_watch "$@" ;;
+	status) cmd_status "$@" ;;
+	__write) privileged_write "$@" ;;
+	help | -h | --help) usage ;;
+	version | -V | --version) say "$PROG $VERSION" ;;
+	*) usage_error "unknown command '$cmd'" ;;
+	esac
+}
+
+main "$@"

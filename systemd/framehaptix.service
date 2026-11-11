@@ -1,0 +1,15 @@
+[Unit]
+Description=Re-apply Framework haptic touchpad settings on login and resume
+Documentation=https://github.com/tompeppercorn/framehaptix
+
+[Service]
+Type=simple
+# `watch` applies the saved preferences now, then again after every resume
+# (systemd-logind PrepareForSleep). --no-elevate: never prompt from a service;
+# install udev/70-framehaptix.rules so no root is needed.
+ExecStart=@BINDIR@/framehaptix watch --no-elevate
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
