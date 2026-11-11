@@ -1,0 +1,10 @@
+# framehaptix: give the logged-in (seat) user access to the hidraw node(s) of
+# the Framework haptic touchpad (PIXA3854), so settings can be applied without
+# sudo. Must sort before 73-seat-late.rules for TAG+="uaccess" to take effect.
+#
+# The touchpad is an ACPI-enumerated I2C-HID device. Its I2C client (a parent of
+# the hidraw node) carries a sysfs `name` attribute like "PIXA3854:00", which is
+# what ATTRS{name} matches here. Verify on your machine with:
+#   udevadm info -a -n /dev/hidrawN | grep -i 'ATTRS{name}'
+# and open an issue/PR if your board reports something different.
+SUBSYSTEM=="hidraw", ATTRS{name}=="*PIXA3854*", TAG+="uaccess"
